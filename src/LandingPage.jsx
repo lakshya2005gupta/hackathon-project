@@ -28,6 +28,11 @@ export default function LandingPage() {
           <p className="mt-2">View your total investments and track profit/loss in real-time.</p>
         </div>
 
+        <div className="bg-gray-800 p-6 rounded-xl shadow-lg text-center cursor-pointer" onClick={() => handleRedirect('/portf/recom.html')}>
+          <h2 className="text-xl font-bold">Asset Allocation</h2>
+          <p className="mt-2">Shows the diversification of the portfolio.</p>
+        </div>
+
         <div className="bg-gray-800 p-6 rounded-xl shadow-lg text-center cursor-pointer" onClick={() => handleRedirect('/portf/allocation.html')}>
           <h2 className="text-xl font-bold">Risk Analysis and Report</h2>
           <p className="mt-2">AI-driven portfolio insights and report generation.</p>
