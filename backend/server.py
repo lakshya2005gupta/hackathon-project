@@ -6,6 +6,19 @@ from data import get_user_portfolio  # Import the database functions
 import time
 from database import save_user_portfolio, get_cached_portfolio  # Import database functions
 import datetime
+import numpy as np
+import pandas as pd
+import ta  # Technical Analysis indicators
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor
+from sklearn.linear_model import Ridge, LinearRegression
+from sklearn.svm import SVR
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.impute import SimpleImputer
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})  # Enable CORS for frontend
@@ -133,8 +146,8 @@ def calculate_portfolio(pan):
         return portfolio  # Return cached portfolio if recent
 
     total_portfolio_value = 0
-    gold_price = get_etf_price("GOLDBEES", 6000)
-    silver_price = get_etf_price("SILVERBEES", 75)
+    gold_price = get_etf_price("GOLDBEES", 73.95)
+    silver_price = get_etf_price("SILVERBEES", 94.18)
 
     for category, details in portfolio["assets"].items():
         total_category_value = 0
@@ -380,6 +393,403 @@ def check_mutual_fund():
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# Assumed base returns and worst-case drawdowns for asset classes.
+ASSET_CLASSES = {
+    "stocks": {"avg_return": 0.15, "worst_drawdown": -0.40},
+    "mutualFunds": {"avg_return": 0.09, "worst_drawdown": -0.30},
+    "FDs": {"avg_return": 0.06, "worst_drawdown": 0.00},
+    "ETFs": {"avg_return": 0.10, "worst_drawdown": -0.25},
+    "govtSchemes": {"avg_return": 0.07, "worst_drawdown": -0.05},
+}
+
+def calculate_cagr(current_wealth, target_wealth, time_frame):
+    """Calculate the required CAGR to reach the target wealth."""
+    return (target_wealth / current_wealth) ** (1 / time_frame) - 1
+
+def simulate_market_scenarios(cagr):
+    """Generate different CAGR projections for Optimistic, Neutral, and Pessimistic cases."""
+    return {
+        "Optimistic": round(cagr * 1.2, 4),
+        "Neutral": round(cagr, 4),
+        "Pessimistic": round(cagr * 0.8, 4)
+    }
+
+def estimate_drawdown(risk_category):
+    """
+    Estimate worst-case drawdown:
+      - Low risk: ~10% loss
+      - Medium risk: ~30% loss
+      - High risk: ~60% loss
+    """
+    risk_mapping = {"Low": 0.10, "Medium": 0.30, "High": 0.60}
+    return round(risk_mapping.get(risk_category, 0.3) * 100, 2)
+
+def normalize_allocation(allocation):
+    """Normalize an allocation dictionary so that the sum equals 100%."""
+    total = sum(allocation.values())
+    return {k: round((v / total) * 100, 2) for k, v in allocation.items()}
+
+def dynamic_allocation(risk_category, required_cagr, investment_type):
+    """
+    Generate a dynamic asset allocation based on:
+      - risk_category: "Low", "Medium", or "High"
+      - required_cagr: overall CAGR required to meet the target
+      - investment_type: "Lump-Sum" or "SIP"
+    
+    The allocation is adjusted continuously relative to a risk-category–specific baseline.
+    """
+    if risk_category == "Low":
+        base = {"stocks": 5, "mutualFunds": 10, "FDs": 60, "ETFs": 5, "govtSchemes": 20}
+        baseline = 0.08  # 8% baseline for low risk.
+        diff = required_cagr - baseline
+        if diff < 0:
+            base["FDs"] += abs(diff) * 50
+            base["govtSchemes"] += abs(diff) * 30
+            base["stocks"] = max(base["stocks"] - abs(diff) * 20, 0)
+            base["ETFs"] = max(base["ETFs"] - abs(diff) * 10, 0)
+    elif risk_category == "Medium":
+        base = {"stocks": 30, "mutualFunds": 30, "FDs": 10, "ETFs": 20, "govtSchemes": 10}
+        baseline = 0.10  # 10% baseline for medium risk.
+        diff = required_cagr - baseline
+        if diff > 0:
+            base["stocks"] += diff * 80
+            base["ETFs"] += diff * 40
+            base["FDs"] = max(base["FDs"] - diff * 40, 0)
+            base["govtSchemes"] = max(base["govtSchemes"] - diff * 20, 0)
+        elif diff < 0:
+            base["stocks"] = max(base["stocks"] + diff * 40, 0)
+            base["ETFs"] = max(base["ETFs"] + diff * 20, 0)
+            base["FDs"] += abs(diff) * 30
+            base["govtSchemes"] += abs(diff) * 10
+    elif risk_category == "High":
+        base = {"stocks": 60, "mutualFunds": 25, "FDs": 0, "ETFs": 10, "govtSchemes": 5}
+        baseline = 0.15  # 15% baseline for high risk.
+        diff = required_cagr - baseline
+        if diff > 0:
+            base["stocks"] += diff * 120
+            base["ETFs"] += diff * 80
+            base["mutualFunds"] = max(base["mutualFunds"] - diff * 20, 0)
+            base["govtSchemes"] = max(base["govtSchemes"] - diff * 10, 0)
+        elif diff < 0:
+            base["stocks"] = max(base["stocks"] + diff * 60, 0)
+            base["ETFs"] = max(base["ETFs"] + diff * 30, 0)
+            base["mutualFunds"] += abs(diff) * 20
+
+    # Further adjust for SIP investments.
+    if investment_type == "SIP":
+        if "mutualFunds" in base:
+            base["mutualFunds"] += 5
+        if "FDs" in base:
+            base["FDs"] = max(base["FDs"] - 5, 0)
+    
+    return normalize_allocation(base)
+
+def compute_dynamic_asset_return(asset):
+    """
+    Compute a dynamic expected return for an asset.
+    Dynamic return = base return + k * abs(worst_drawdown).
+    Adjust k to increase or decrease the risk premium.
+    """
+    k = 0.5  # Risk premium factor; increase if you need a larger spread.
+    base_return = ASSET_CLASSES[asset]["avg_return"]
+    drawdown = abs(ASSET_CLASSES[asset]["worst_drawdown"])
+    return base_return + k * drawdown
+
+def compute_expected_return(allocation, risk_category):
+    """
+    Compute the expected annual return for a basket as the weighted average of dynamic asset returns.
+    Then, apply an additional risk premium adjustment:
+      - Low risk: subtract ~1%
+      - High risk: add ~4%
+    """
+    base_return = 0.0
+    for asset, perc in allocation.items():
+        asset_dynamic_return = compute_dynamic_asset_return(asset)
+        base_return += (perc / 100) * asset_dynamic_return
+
+    if risk_category == "Low":
+        return base_return - 0.01
+    elif risk_category == "High":
+        return base_return + 0.04
+    return base_return
+
+def forecast_wealth_growth(initial_wealth, annual_return, time_frame):
+    """Forecast yearly wealth growth based on the annual return."""
+    growth = []
+    for year in range(1, time_frame + 1):
+        wealth = initial_wealth * ((1 + annual_return) ** year)
+        growth.append({"year": year, "wealth": round(wealth, 2)})
+    return growth
+
+def feasibility_check(cagr):
+    """Check if the overall required CAGR is realistic."""
+    if cagr > 0.20:
+        return {
+            "warning": "Your target requires extremely high returns (CAGR > 20%). Consider increasing the time frame or investing more.",
+            "alternativeGoal": f"Increase time frame by 2 years to require only {round(((cagr + 1) ** (1 / 1.2) - 1) * 100, 2)}% CAGR."
+        }
+    return {}
+
+def ai_investment_advice(cagr):
+    """Provide AI-driven advice based on overall required CAGR."""
+    if cagr < 0.07:
+        return "Your target return is low. Consider a very conservative portfolio emphasizing FDs and Govt Schemes."
+    elif cagr < 0.15:
+        return "A balanced portfolio with a mix of mutual funds, ETFs, and stocks is recommended."
+    else:
+        return "High returns are required. An aggressive portfolio with a significantly higher allocation to stocks and ETFs is suggested."
+
+@app.route('/calculate-baskets', methods=['POST'])
+def calculate_baskets():
+    """
+    API endpoint to generate diversified investment baskets dynamically (Low, Medium, High).
+    For each basket, we compute:
+      - Dynamic asset allocation based on required CAGR,
+      - Expected annual return (using dynamic returns and risk premium),
+      - Yearly wealth projection,
+      - Final wealth and goal achievement (or shortfall).
+    Also returns overall market scenarios, feasibility, and AI-driven advice.
+    """
+    try:
+        data = request.get_json()
+        current_wealth = float(data.get("currentWealth", 0))
+        target_wealth = float(data.get("targetWealth", 0))
+        time_frame = int(data.get("timeFrame", 0))
+        investment_type = data.get("investmentType", "Lump-Sum")  # "Lump-Sum" or "SIP"
+
+        if current_wealth <= 0 or target_wealth <= 0 or time_frame <= 0:
+            return jsonify({"error": "Invalid input values"}), 400
+
+        req_cagr = calculate_cagr(current_wealth, target_wealth, time_frame)
+        market_scenarios = simulate_market_scenarios(req_cagr)
+
+        baskets_result = {}
+        for risk in ["Low", "Medium", "High"]:
+            alloc = dynamic_allocation(risk, req_cagr, investment_type)
+            exp_return = compute_expected_return(alloc, risk)
+            projection = forecast_wealth_growth(current_wealth, exp_return, time_frame)
+            final_wealth = projection[-1]["wealth"]
+            goal_met = final_wealth >= target_wealth
+            shortfall = target_wealth - final_wealth if not goal_met else 0
+
+            baskets_result[risk] = {
+                "allocation": alloc,
+                "expectedReturn": round(exp_return * 100, 2),
+                "finalWealth": final_wealth,
+                "goalAchieved": goal_met,
+                "shortfall": round(shortfall, 2),
+                "wealthProjection": projection
+            }
+        
+        feasibility = feasibility_check(req_cagr)
+        advice = ai_investment_advice(req_cagr)
+
+        result = {
+            "requiredCAGR": round(req_cagr * 100, 2),
+            "marketScenarios": {k: round(v * 100, 2) for k, v in market_scenarios.items()},
+            "baskets": baskets_result,
+            "feasibility": feasibility,
+            "investmentAdvice": advice
+        }
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------------
+# Helper Functions Machine Learning
+# --------------------------
+def get_numeric_series(df, column):
+    series = df[column]
+    if not isinstance(series, pd.Series):
+        series = series.squeeze()
+    return pd.to_numeric(series, errors='coerce')
+
+def safe_serialize(obj):
+    """Ensure JSON serializability"""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, pd.DataFrame):
+        return obj.to_dict(orient="records")
+    elif isinstance(obj, pd.Series):
+        return obj.to_dict()
+    return obj
+
+def fetch_stock_data(ticker, max_retries=3, delay=5):
+    """Handle Yahoo Finance timeouts with retries"""
+    for attempt in range(max_retries):
+        try:
+            df = yf.download(ticker, period="max", auto_adjust=True, timeout=20)
+            if not df.empty:
+                return df
+        except Exception as e:
+            print(f"Attempt {attempt + 1}: Failed to fetch data for {ticker}. Error: {e}")
+            time.sleep(delay)
+    return None  # Return None if all retries fail
+
+# --------------------------
+# Compute Technical Indicators
+# --------------------------
+def add_technical_indicators(df):
+    df = df.sort_index().copy()
+    df = df.loc[:, ~df.columns.duplicated()]
+    
+    close_series = get_numeric_series(df, "Close")
+    high_series = get_numeric_series(df, "High")
+    low_series = get_numeric_series(df, "Low")
+    volume_series = get_numeric_series(df, "Volume")
+
+    df["MA50"] = close_series.rolling(window=50, min_periods=1).mean()
+    df["MA200"] = close_series.rolling(window=200, min_periods=1).mean()
+    df["RSI"] = ta.momentum.RSIIndicator(close_series, window=14).rsi()
+    macd = ta.trend.MACD(close_series)
+    df["MACD"] = macd.macd()
+    bollinger = ta.volatility.BollingerBands(close_series)
+    df["BB_Upper"] = bollinger.bollinger_hband()
+    df["BB_Lower"] = bollinger.bollinger_lband()
+    adx_indicator = ta.trend.ADXIndicator(high=high_series, low=low_series, close=close_series, window=14)
+    df["ADX"] = adx_indicator.adx()
+    obv_indicator = ta.volume.OnBalanceVolumeIndicator(close=close_series, volume=volume_series)
+    df["OBV"] = obv_indicator.on_balance_volume()
+
+    for col in ["RSI", "MACD", "BB_Upper", "BB_Lower", "ADX", "OBV"]:
+        df[col] = df[col].bfill()
+
+    return df
+
+# --------------------------
+# Add Fundamental Indicators
+# --------------------------
+def add_fundamental_indicators(df, ticker):
+    tkr = yf.Ticker(ticker)
+    try:
+        info = tkr.info
+    except Exception as e:
+        print(f"Failed to fetch fundamentals for {ticker}. Error: {e}")
+        info = {}
+
+    fundamental_features = {
+        "MarketCap": info.get("marketCap", np.nan),
+        "TrailingPE": info.get("trailingPE", np.nan),
+        "ForwardPE": info.get("forwardPE", np.nan),
+        "PriceToBook": info.get("priceToBook", np.nan),
+        "DividendYield": info.get("dividendYield", np.nan),
+        "Beta": info.get("beta", np.nan),
+        "returnOnEquity": info.get("returnOnEquity", np.nan)
+    }
+    
+    for key, value in fundamental_features.items():
+        df[key] = 0.0 if pd.isna(value) else value
+    
+    return df
+
+# --------------------------
+# LSTM Model
+# --------------------------
+def create_lstm_model(input_shape):
+    model = Sequential([
+        LSTM(128, return_sequences=True, input_shape=input_shape),
+        Dropout(0.2),
+        LSTM(64, return_sequences=False),
+        Dropout(0.2),
+        Dense(32, activation='relu'),
+        Dense(1, activation='linear')
+    ])
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+# --------------------------
+# Flask API Route
+# --------------------------
+@app.route('/predict', methods=['POST'])
+def predict():
+    data = request.get_json()
+    stock = data.get("stock")
+    prediction_period = int(data.get("prediction_period", 63))
+
+    df = yf.download(stock, period="max", auto_adjust=True)
+    if df.empty:
+        return jsonify({"error": f"No data fetched for {stock}"}), 400
+
+    df["Stock"] = stock
+    df = df.sort_index()
+    df_ti = add_technical_indicators(df)
+    df_ti = add_fundamental_indicators(df_ti, stock)
+
+    df_ti["Target"] = (df_ti["Close"].shift(-prediction_period) / df_ti["Close"]) - 1
+    df_ti = df_ti.iloc[:-prediction_period]
+
+    features = ["MA50", "MA200", "RSI", "MACD", "BB_Upper", "BB_Lower", "ADX", "OBV",
+                "MarketCap", "TrailingPE", "ForwardPE", "PriceToBook", "DividendYield", "Beta"]
+    
+    X = df_ti[features].dropna()
+    y = df_ti["Target"].dropna()
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    base_models = [
+        ('rf', RandomForestRegressor(n_estimators=100, random_state=42)),
+        ('gbr', GradientBoostingRegressor(random_state=42)),
+        ('svr', SVR()),
+        ('ridge', Ridge())
+    ]
+
+    stacking_reg = StackingRegressor(
+        estimators=base_models,
+        final_estimator=LinearRegression(),
+        cv=5
+    )
+
+    pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler()),
+        ('stacking', stacking_reg)
+    ])
+
+    pipeline.fit(X_train, y_train)
+
+    # Prepare latest data for LSTM
+    scaler = MinMaxScaler()
+    X_scaled = scaler.fit_transform(X_train)
+    X_lstm = np.reshape(X_scaled, (X_scaled.shape[0], 1, X_scaled.shape[1]))
+
+    lstm_model = create_lstm_model((1, X_scaled.shape[1]))
+    lstm_model.fit(X_lstm, y_train, epochs=50, batch_size=32, verbose=1)
+
+    predicted_growth = pipeline.predict([X.iloc[-1].values])[0]
+    predicted_lstm = lstm_model.predict(X_lstm[-1].reshape(1, 1, X_lstm.shape[2]))[0][0]
+
+    final_prediction = (predicted_growth + predicted_lstm) / 2
+
+    return jsonify({"stock": stock, "predicted_growth_percent": round(final_prediction * 100, 2)})
+
+@app.route("/get_stock_suggestions", methods=["GET"])
+def get_stock_suggestions():
+    query = request.args.get("q", "").strip()
+    
+    if len(query) < 2:
+        return jsonify({"stocks": []})
+
+    url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}"
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    try:
+        response = requests.get(url, headers=headers)
+        data = response.json()
+
+        stocks = []
+        for stock in data.get("quotes", []):
+            if "symbol" in stock and "shortname" in stock:
+                stocks.append({"symbol": stock["symbol"], "name": stock["shortname"]})
+
+        return jsonify({"stocks": stocks})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 
 if __name__ == "__main__":
     app.run(debug=True)
